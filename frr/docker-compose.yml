@@ -1,0 +1,54 @@
+name: rpolicy-lab
+
+# Two local-only FRRouting nodes on an isolated bridge. No ports are
+# published to production-facing interfaces; the FastAPI backend talks to
+# them via `docker exec` (default) or SSH (optional).
+#
+#   docker compose -f frr/docker-compose.yml up -d
+#   cd backend && python3 -m pytest tests/test_frr_consistency.py
+#
+# `show ip prefix-list NAME match PREFIX` inside FRR is the reference
+# oracle for the ipaddress-based simulator.
+
+services:
+  router-a:
+    image: frrouting/frr:v8.4.1
+    container_name: rpolicy-router-a
+    hostname: router-a
+    privileged: true
+    restart: unless-stopped
+    networks:
+      labnet:
+        ipv4_address: 172.30.10.1
+    volumes:
+      - ./router-a/daemons:/etc/frr/daemons:ro
+      - ./router-a/vtysh.conf:/etc/frr/vtysh.conf:ro
+      - ./router-a/frr.conf:/etc/frr/frr.conf:ro
+    # expose vtysh over a published port for manual inspection:
+    #   socat - TCP:127.0.0.1:2222  (see README)
+    ports:
+      - "127.0.0.1:2222:2605"
+
+  router-b:
+    image: frrouting/frr:v8.4.1
+    container_name: rpolicy-router-b
+    hostname: router-b
+    privileged: true
+    restart: unless-stopped
+    networks:
+      labnet:
+        ipv4_address: 172.30.10.2
+    volumes:
+      - ./router-b/daemons:/etc/frr/daemons:ro
+      - ./router-b/vtysh.conf:/etc/frr/vtysh.conf:ro
+      - ./router-b/frr.conf:/etc/frr/frr.conf:ro
+    ports:
+      - "127.0.0.1:2223:2605"
+
+networks:
+  labnet:
+    driver: bridge
+    internal: true               # no external connectivity by default
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24

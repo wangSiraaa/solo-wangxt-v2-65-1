@@ -1,0 +1,93 @@
+name: rpolicy-workbench
+
+# Full local stack: PostgreSQL + FastAPI + FRR (router-a/b).
+# The React UI is served by Vite in development (npm run dev) or as static
+# files in production; everything is on the local host, no production links.
+#
+#   docker compose up -d postgres router-a router-b
+#   cd backend && DATABASE_URL=postgresql+psycopg://rlab:rlab@127.0.0.1:5432/rlab \
+#       python -m app.seed && uvicorn app.main:app --port 8765
+#   cd frontend && npm install && npm run dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rpolicy-postgres
+    environment:
+      POSTGRES_USER: rlab
+      POSTGRES_PASSWORD: rlab
+      POSTGRES_DB: rlab
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rlab"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: rpolicy-backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://rlab:rlab@postgres:5432/rlab
+      RLAB_FRR_TRANSPORT: docker
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    ports:
+      - "127.0.0.1:8765:8765"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      router-a:
+        condition: service_started
+      router-b:
+        condition: service_started
+    # cross-validation runs `docker exec rpolicy-router-X vtysh ...`; mount
+    # the host docker socket so the backend can drive the local FRR nodes.
+    # (Lab-only; never expose this socket to production-facing services.)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      sh -c "python -m app.seed &&
+             python -m uvicorn app.main:app --host 0.0.0.0 --port 8765"
+
+  router-a:
+    image: frrouting/frr:v8.4.1
+    container_name: rpolicy-router-a
+    hostname: router-a
+    privileged: true
+    restart: unless-stopped
+    networks:
+      labnet:
+        ipv4_address: 172.30.10.1
+    volumes:
+      - ./frr/router-a/daemons:/etc/frr/daemons:ro
+      - ./frr/router-a/vtysh.conf:/etc/frr/vtysh.conf:ro
+      - ./frr/router-a/frr.conf:/etc/frr/frr.conf:ro
+
+  router-b:
+    image: frrouting/frr:v8.4.1
+    container_name: rpolicy-router-b
+    hostname: router-b
+    privileged: true
+    restart: unless-stopped
+    networks:
+      labnet:
+        ipv4_address: 172.30.10.2
+    volumes:
+      - ./frr/router-b/daemons:/etc/frr/daemons:ro
+      - ./frr/router-b/vtysh.conf:/etc/frr/vtysh.conf:ro
+      - ./frr/router-b/frr.conf:/etc/frr/frr.conf:ro
+
+networks:
+  labnet:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
+
+volumes:
+  pgdata:
