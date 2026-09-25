@@ -73,10 +73,17 @@ def get_policy(pid: int, db: Session = Depends(get_db)):
 @router.put("/policies/{pid}")
 def update_policy_meta(pid: int, body: PolicyIn, db: Session = Depends(get_db)):
     p = _get_policy(db, pid)
+    changed = (p.default_action != body.default_action
+               or p.name != body.name)
     p.default_action = body.default_action
     p.description = body.description
     db.commit()
     db.refresh(p)
+    if changed:
+        # the approval packet freezes the default action (and identity):
+        # any change invalidates open releases of this policy.
+        from ..release import invalidate_open_releases
+        invalidate_open_releases(db, pid, reason="policy_meta_edited")
     return service.policy_payload(p)
 
 
@@ -250,6 +257,17 @@ def create_neighbor(body: NeighborIn, db: Session = Depends(get_db)):
     db.add(n)
     db.commit()
     db.refresh(n)
+    # neighbor bindings are part of the frozen approval packet: invalidate
+    # open releases of any policy this neighbor references by name.
+    from ..release import invalidate_open_releases
+    for ref in (n.inbound_policy, n.outbound_policy):
+        if not ref:
+            continue
+        pol = db.query(dbmod.Policy).filter_by(name=ref).first()
+        if pol:
+            invalidate_open_releases(
+                db, pol.id, reason="neighbors_changed",
+                detail={"neighbor": n.name})
     return {"id": n.id, **body.model_dump()}
 
 

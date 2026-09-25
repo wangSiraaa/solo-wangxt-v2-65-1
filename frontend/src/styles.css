@@ -93,3 +93,35 @@ th { color: var(--muted); font-weight: 600; }
 .cvbox.mismatch { border-left: 4px solid var(--deny); }
 tr.badrow { background: rgba(255,107,107,.08); }
 tr.okrow { background: rgba(46,204,113,.06); }
+/* release gate */
+.gate-cols { display: grid; grid-template-columns: 380px 1fr; gap: 16px; margin-top: 6px; }
+.gate-list, .gate-detail { background: var(--panel2); border-radius: 10px; padding: 10px 12px; }
+tr.selrow { outline: 1px solid var(--accent); }
+.st-draft { background: #2b3550; color: #c6d2ee; }
+.st-validating { background: #3a3416; color: #ffe39a; }
+.st-failed { background: #4a2020; color: #ffc1c1; }
+.st-pending { background: #4a3c18; color: #ffe0a0; }
+.st-approved { background: #21405f; color: #a8d2ff; }
+.st-live { background: #143a24; color: #87e0a3; }
+.st-superseded { background: #333844; color: #98a2b8; text-decoration: line-through; }
+.tag.rollback { background: #3d2a52; color: #d3b3ff; }
+.flow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0 10px; }
+.flowstep { padding: 4px 9px; border-radius: 8px; font-size: 12.5px; background: #222a3c;
+  color: var(--muted); border: 1px solid var(--line); }
+.flowstep.past { opacity: .55; }
+.flowarrow { color: var(--muted); }
+.flow-fail { color: var(--deny); font-size: 11px; margin-left: 4px; }
+.flow-sup { margin-left: 8px; text-decoration: none; }
+.actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.approve-box { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.approve-box .comment { min-width: 260px; }
+button.danger { border-color: #7a3a3a; color: #ffb3b3; }
+button.bigbtn { padding: 6px 12px; font-size: 13px; }
+.errbox { background: #3a1f1f; border: 1px solid #7a3a3a; border-radius: 8px;
+  padding: 8px 10px; width: 100%; }
+.errbox pre { max-height: 150px; }
+.evidence details { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+  margin: 8px 0; background: #141b29; }
+.evidence summary { cursor: pointer; font-weight: 600; }
+.ev-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 8px 0; }
+.ev-grid div { background: #0c111c; border-radius: 6px; padding: 6px 8px; font-size: 12.5px; }

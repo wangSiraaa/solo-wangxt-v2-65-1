@@ -34,6 +34,9 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://rlab:rlab@postgres:5432/rlab
       RLAB_FRR_TRANSPORT: docker
+      # comma-separated isolated nodes a simulated publish must apply to;
+      # the dedicated published prefix-list is named rlabpub{policy_id}
+      RLAB_PUBLISH_NODES: a,b
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     ports:
       - "127.0.0.1:8765:8765"

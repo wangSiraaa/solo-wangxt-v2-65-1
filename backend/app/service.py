@@ -97,6 +97,11 @@ def replace_rules(session: Session, db_pol: dbmod.Policy,
     session.add(db_pol)
     session.commit()
     session.refresh(db_pol)
+    # editing after a draft/approval invalidates every open release:
+    # reviewers can never approve a frozen packet whose content moved.
+    from .release import invalidate_open_releases
+    invalidate_open_releases(session, db_pol.id,
+                             reason="rules_edited")
     return db_pol
 
 

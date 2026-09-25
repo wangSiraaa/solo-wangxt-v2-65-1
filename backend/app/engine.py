@@ -224,10 +224,17 @@ class Policy:
         from .trie import minimal_witness_set
         return minimal_witness_set(self, other)
 
-    def to_frr_prefix_list(self) -> str:
-        """Render FRR/vtysh ip prefix-list configuration lines."""
+    def to_frr_prefix_list(self, name: Optional[str] = None) -> str:
+        """Render FRR/vtysh ip prefix-list configuration lines.
+
+        `name` overrides the prefix-list name: validation installs under the
+        policy name (temporary, removed after the run), simulated publishes
+        install under a dedicated stable name (rlabpub{id}) so old/new
+        versions and cross-validation lists never collide.
+        """
         if self.family is None:
             return ""
+        plname = name or self.name
         ip = "ip" if self.family == 4 else "ipv6"
         lines = []
         for r in self.rules:
@@ -237,7 +244,7 @@ class Policy:
             if r.le is not None:
                 tail += f" le {r.le}"
             lines.append(
-                f"{ip} prefix-list {self.name} seq {r.seq} {r.action.value} {r.prefix}{tail}"
+                f"{ip} prefix-list {plname} seq {r.seq} {r.action.value} {r.prefix}{tail}"
             )
         return "\n".join(lines)
 

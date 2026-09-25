@@ -39,4 +39,25 @@ export const api = {
   crossValidate: (id, probes, node = 'a') =>
     req(`/snapshots/${id}/cross-validate`, { method: 'POST', body: { probes, node } }),
   runs: () => req('/runs'),
+  // reviewable release pipeline
+  releases: (pid) => req(`/policies/${pid}/releases`),
+  activeRelease: (pid) => req(`/policies/${pid}/releases/active`),
+  allReleases: (params = {}) => {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v != null && v !== '')
+    ).toString();
+    return req(`/releases${q ? `?${q}` : ''}`);
+  },
+  release: (id) => req(`/releases/${id}`),
+  createDraft: (pid, body = {}) =>
+    req(`/policies/${pid}/releases/draft`, { method: 'POST', body }),
+  validateRelease: (id, body = {}) =>
+    req(`/releases/${id}/validate`, { method: 'POST', body }),
+  approveRelease: (id, body) =>
+    req(`/releases/${id}/approve`, { method: 'POST', body }),
+  publishRelease: (id, body = {}) =>
+    req(`/releases/${id}/publish`, { method: 'POST', body }),
+  rollbackRelease: (id, body = {}) =>
+    req(`/releases/${id}/rollback`, { method: 'POST', body }),
+  liveConfig: (id) => req(`/releases/${id}/live-config`),
 };

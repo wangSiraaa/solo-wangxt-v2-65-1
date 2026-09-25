@@ -8,8 +8,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import CORS_ORIGINS
-from .db import init_db
 from .routers.api import router
+from .routers.releases import router as release_router
 
 app = FastAPI(
     title="Routing Policy Rehearsal Workbench",
@@ -27,11 +27,15 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(release_router)
 
 
 @app.on_event("startup")
 def _startup():
-    init_db()
+    # idempotent: fresh DBs are created from revisions; legacy create_all DBs
+    # are stamped at the baseline and upgraded from there.
+    from .migrate import upgrade
+    upgrade()
 
 
 @app.get("/api")

@@ -5,8 +5,8 @@ import datetime as dt
 from typing import List
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
-    create_engine, select,
+    JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text,
+    UniqueConstraint, create_engine, select, text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session,
@@ -129,6 +129,77 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String(16), default="ok")   # ok/mismatch/error
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class Release(Base):
+    """
+    A reviewable release record carrying one IMMUTABLE snapshot through the
+    draft -> validating -> (validation_failed | pending_approval |
+    approved -> simulated_published) -> superseded state machine.
+
+    Evidence captured at validation time and frozen again at approval is
+    stored as JSON blobs; a release never mutates historical rows.  Editing
+    a policy's rules/neighbors invalidates every open release of that policy
+    (state -> superseded, reason invalidated_by_edit); a rollback never
+    overwrites this row, it creates a NEW release of kind='rollback'.
+    """
+    __tablename__ = "releases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    policy_id: Mapped[int] = mapped_column(ForeignKey("policies.id", ondelete="CASCADE"))
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("snapshots.id"))
+    kind: Mapped[str] = mapped_column(String(16), default="release")  # release|rollback
+    state: Mapped[str] = mapped_column(String(32), default="draft")
+    version_label: Mapped[str] = mapped_column(String(128), default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="lab")
+    approved_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # frozen validation evidence (set when pending_approval is reached)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    # approval packet: a re-freeze of evidence hashes/content at approve time
+    approval: Mapped[dict] = mapped_column(JSON, default=dict)
+    # last failure detail (validation_failed / publish error) - retryable
+    last_error: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    # simulated publish bookkeeping
+    published_nodes: Mapped[list] = mapped_column(JSON, default=list)
+    published_config: Mapped[str] = mapped_column(Text, default="")
+    published_config_checksum: Mapped[str] = mapped_column(String(64), default="")
+
+    # rollback provenance: the release this rollback reverts
+    rollback_of_id: Mapped[int | None] = mapped_column(
+        ForeignKey("releases.id"), nullable=True)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow)
+
+    policy: Mapped[Policy] = relationship(foreign_keys=[policy_id])
+    snapshot: Mapped[Snapshot] = relationship(foreign_keys=[snapshot_id])
+    rollback_of: Mapped["Release | None"] = relationship(
+        remote_side=[id], foreign_keys=[rollback_of_id])
+
+    # NOTE: deliberately NO unique constraint on (policy_id, snapshot_id):
+    # a rollback creates a brand-new release record that points at a
+    # historical snapshot already used by an older release, without
+    # rewriting that older release.  The only uniqueness invariant is the
+    # partial index on the single active release per policy (see migration).
+    __table_args__ = (
+        Index("ix_release_policy_snapshot", "policy_id", "snapshot_id"),
+    )
+
+
+class ReleaseEvent(Base):
+    """Append-only audit trail for a release record."""
+    __tablename__ = "release_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    release_id: Mapped[int] = mapped_column(
+        ForeignKey("releases.id", ondelete="CASCADE"))
+    at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+    actor: Mapped[str] = mapped_column(String(64), default="lab")
+    event: Mapped[str] = mapped_column(String(48))
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 def init_db() -> None:

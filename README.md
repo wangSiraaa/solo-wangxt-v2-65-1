@@ -2,10 +2,10 @@
 
 在**发布前**离线看清前缀策略会放行/拒绝哪些前缀。完全本地，**不连接任何生产设备**。
 
-* **React**：前缀树 + 命中链可视化、规则编辑、遮蔽检查、语义差异（最小见证前缀集）、有序回放、FRR 交叉验证
-* **FastAPI**：REST API，判定核心用 Python 标准库 **`ipaddress`**
-* **PostgreSQL**：邻居、有序规则、不可变配置快照、场景、验证运行（也可用 SQLite 免依赖运行）
-* **FRRouting 容器**（router-a / router-b，隔离 bridge）：用 FRR 自己的 prefix-list 匹配器做交叉验证
+* **React**：前缀树 + 命中链可视化、规则编辑、遮蔽检查、语义差异（最小见证前缀集）、有序回放、FRR 交叉验证、**验证/审批/模拟发布/回滚闭环**
+* **FastAPI**：REST API（状态机 + 幂等），判定核心用 Python 标准库 **`ipaddress`**
+* **PostgreSQL**：邻居、有序规则、不可变配置快照、场景、验证运行、**发布记录与审计事件**（也可用 SQLite 免依赖运行；Alembic 迁移）
+* **FRRouting 容器**（router-a / router-b，隔离 bridge）：用 FRR 自己的 prefix-list 匹配器做交叉验证，模拟发布也只写入这两个本地容器
 
 ---
 
@@ -64,7 +64,58 @@
 
 FRR 语义已对照其源码 `lib/plist.c` 核对（包含关系、无 ge/le 精确匹配、窗口、首条最小 seq、未命中 DENY）。注意 FRR 对**空** prefix-list 返回 PERMIT，因此空策略会被报为 lab setup error 而非静默一致。
 
-传输默认 `docker exec`（`RLAB_FRR_TRANSPORT=docker`），也可切到 SSH（`RLAB_FRR_TRANSPORT=ssh`，见 `backend/app/config.py`）。容器不在线时相关测试自动 skip，UI 显示离线徽标。
+传输默认 `docker exec`（`RLAB_FRR_TRANSPORT=docker`），也可切到 SSH（`RLAB_FRR_TRANSPORT=ssh`，见 `backend/app/config.py`）。容器不在线时相关测试自动 skip，UI 显示离线徽标。无 Docker 的环境（CI、评审机）可设 `RLAB_FRR_TRANSPORT=stub`：进程内实现同一份 FRR `prefix_list_apply` 语义，发布管线全流程可跑、可注入容器失败（仅实验室用途）。
+
+## 4b. 可审查发布流程（验证 → 审批 → 模拟发布 → 回滚）
+
+推演通过的快照不再直接"生效"，而是进入一个显式状态机（`backend/app/release.py`，UI 第 ④ 页）：
+
+```
+draft 草稿
+  └─ validate ─▶ validating 验证中
+                  ├─▶ validation_failed 验证失败（可重试）
+                  └─▶ pending_approval 待审批
+                         └─ approve ─▶ approved 已批准
+                                          └─ publish ─▶ simulated_published 已模拟发布
+任意非终态 ─▶ superseded 已替代（规则后续编辑 / 被更新版本取代）
+```
+
+**冻结的审批证据**（批准时整体再做一次校验和冻结，存 `releases.evidence/approval` JSON）：
+
+1. **规则顺序**：快照内有序规则 + `rules_checksum`；
+2. **邻居**：当时全部邻居绑定（名称/IP/族/ASN/入出站策略）+ 邻居校验和；
+3. **默认动作**与地址族；
+4. **语义差异**：相对当前生效版本（首个版本相对隐式空策略 deny-all）的**最小见证前缀集**；
+5. **探针结果**：确定性生成的探针（每个规则基址、窗口内/边界前缀、默认区域、全部见证前缀，去重且限量）+ 审批人自定义探针的有序模拟器判定；
+6. **FRRouting 交叉验证证据**：每个发布节点（默认 router-a、router-b）一条 `runs` 记录、状态、逐条 FRR 原生匹配结果；
+7. **默认拒绝守卫**：外部探针（v4 `192.0.2.255/32`、v6 `2001:db8:ffff::/64`）在 default-deny 快照下必须 deny，否则验证失败。
+
+**后续编辑即新草稿**：`PUT /rules`、默认动作变化、邻居变更都会把该策略所有非终态发布记录置为 `superseded`；对陈旧草稿点验证、对陈旧待审批点批准都会被 409 拒绝。历史快照本身永不改写。
+
+**模拟发布只写隔离 FRR**：配置以独立稳定名 `rlabpub{policy_id}` 安装（与交叉验证临时使用的"策略名"列表互不干扰），流程严格保证数据库与容器不漂移：
+
+1. 先逐节点 `remove → install → show 校验每条 seq/action`，任一节点失败即停止；
+2. 已改动的节点**尽力回滚为上一个生效配置**（同一发布名），行状态留在 `approved` + `last_error`，可直接重试；
+3. 全部节点确认后才开事务翻转数据库：新版本 `simulated_published`、旧生效版本 `superseded`；
+4. 进程锁 + 部分唯一索引
+   `CREATE UNIQUE INDEX ... ON releases(policy_id) WHERE state='simulated_published'`
+   保证重复/并发发布**只有一个版本生效**（重复发布是返回同一条目的幂等 no-op；被更新版本超越的旧批准发布返回 409）。
+
+**回滚不改写历史**：`POST /api/releases/{id}/rollback` 从该历史记录的**快照**创建一条全新的 `kind=rollback` 记录（`rollback_of_id` 指回来源），重新走 validate → approve → publish；回滚记录豁免"快照必须等于当前编辑态"的新鲜度检查。回滚后可核对：前/后两个快照、最小见证前缀（`/api/snapshots/diff`）、以及 `GET /api/releases/{id}/live-config` 读回的**容器实际 prefix-list**（含校验和）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/policies/{id}/releases/draft` | 当前规则铸造新快照并生成草稿（同内容重复 POST 幂等复用） |
+| GET | `/api/policies/{id}/releases`、`/api/releases` | 发布历史（可按 state/policy 过滤） |
+| GET | `/api/releases/{id}` | 发布记录 + 冻结证据 + append-only 事件 |
+| POST | `/api/releases/{id}/validate` | 验证（可带自定义 probes/nodes），失败可重试 |
+| POST | `/api/releases/{id}/approve` | 批准（审批人/意见），冻结证据并替代其他待审批/已批准 |
+| POST | `/api/releases/{id}/publish` | 模拟发布（幂等；容器失败返回 200+approved+last_error，可重试） |
+| POST | `/api/releases/{id}/rollback` | 从历史快照创建新的回滚草稿 |
+| GET | `/api/policies/{id}/releases/active` | 当前唯一生效版本 |
+| GET | `/api/releases/{id}/live-config` | 各隔离节点实际安装配置与发布校验和比对 |
+
+数据库迁移（Alembic，`backend/migrations/`）：`0001_baseline`（原始表）→ `0002_releases`（发布/事件表 + 部分唯一索引）。API 启动与 `app.seed` 自动升级；老的 `create_all` 库会被自动 stamp 到 baseline 再升级，升级幂等。手动执行：`python -m app.migrate`。
 
 ## 5. 快速开始
 
@@ -110,6 +161,7 @@ python -m pytest tests/ -q
 * `test_engine.py`：精确匹配、ge/le 窗口、首条匹配、默认拒绝、v4/v6 隔离、三个示例决策；
 * `test_properties.py`：在完整枚举的 /0../6（v4）与 /32../34（v6）格子上，对数百个随机策略用暴力预言机验证**遮蔽判定**与**最小见证集**逐区域一致（非采样）；
 * `test_api.py`：编辑→快照→差异→回放的端到端 REST；
+* `test_release_pipeline.py`：发布状态机验收——验证/审批证据冻结可回放、规则变更使旧审批失效、重复/并发发布仅一个生效、容器应用失败后 DB 可重试且恢复成功、回滚新建记录且前后快照/见证前缀/实际隔离配置可核对、IPv4/IPv6 与默认拒绝不回归；
 * `test_frr_consistency.py`：FRR 输出解析、随机 400 例与 FRR `prefix_list_apply` 移植模型逐条一致；`test_live_frr_consistency` 在检测到容器时自动对真实 FRR 运行。
 
 ## 7. 主要 API
@@ -134,9 +186,13 @@ python -m pytest tests/ -q
 
 ```
 backend/app/   engine.py(匹配/遮蔽) trie.py(精确单元+最小见证) service.py db.py
-               validate.py frr_bridge.py treeview.py routers/api.py seed.py
-frontend/src/  App.jsx + components/(PolicyEditor/TrieView/DiffView/ReplayLab/Neighbors)
+               validate.py frr_bridge.py(含无Docker环境的 stub 传输)
+               release.py(发布状态机/证据/模拟发布/回滚)
+               migrate.py routers/(api.py, releases.py) seed.py
+backend/migrations/  Alembic: 0001_baseline -> 0002_releases
+frontend/src/  App.jsx + components/(PolicyEditor/TrieView/DiffView/
+               ReleaseGate+EvidencePanel/ReplayLab/Neighbors)
 frr/           两个节点的 daemons/vtysh/frr.conf 与独立 docker-compose
-tests/         引擎/属性/API/FRR 一致性
+tests/         引擎/属性/API/发布管线/FRR 一致性
 docker-compose.yml   postgres + backend + router-a/b
 ```

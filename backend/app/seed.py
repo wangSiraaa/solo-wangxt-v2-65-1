@@ -148,7 +148,8 @@ NEIGHBORS = [
 
 
 def seed_all() -> None:
-    dbmod.init_db()
+    from .migrate import upgrade
+    upgrade()
     s = dbmod.SessionLocal()
     try:
         for nb in NEIGHBORS:

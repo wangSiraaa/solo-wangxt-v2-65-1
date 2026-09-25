@@ -63,3 +63,27 @@ class NeighborIn(BaseModel):
     inbound_policy: Optional[str] = None
     outbound_policy: Optional[str] = None
     description: str = ""
+
+
+# --------------------------------------------------------- release pipeline
+class ReleaseDraftIn(BaseModel):
+    label: str = ""
+    created_by: str = "lab"
+
+
+class ReleaseValidateIn(BaseModel):
+    probes: Optional[List[str]] = None
+    nodes: Optional[List[str]] = None
+
+
+class ReleaseApproveIn(BaseModel):
+    approved_by: str = Field(default="reviewer", min_length=1, max_length=64)
+    comment: str = ""
+
+
+class ReleasePublishIn(BaseModel):
+    nodes: Optional[List[str]] = None
+
+
+class ReleaseRollbackIn(BaseModel):
+    actor: str = "lab"

@@ -22,4 +22,13 @@ FRR_SSH_PORT_B = int(os.environ.get("FRR_SSH_PORT_B", "2223"))
 FRR_SSH_USER = os.environ.get("FRR_SSH_USER", "root")
 FRR_SSH_PASSWORD = os.environ.get("FRR_SSH_PASSWORD", "frrouting")
 
+# Nodes a simulated publish writes to; publish validates/applies every node
+# listed here.  Lab-only (internal bridge), never production equipment.
+PUBLISH_NODES = [n.strip() for n in os.environ.get(
+    "RLAB_PUBLISH_NODES", "a,b").split(",") if n.strip()]
+# Prefix-list name reserved for the currently published revision of a policy.
+# Validation runs use the policy's own name and delete it afterwards, so the
+# two never collide inside the isolated FRR containers.
+PUBLISH_PLIST_PREFIX = os.environ.get("RLAB_PUBLISH_PLIST_PREFIX", "rlabpub")
+
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",")
