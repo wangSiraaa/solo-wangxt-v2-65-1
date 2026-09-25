@@ -62,9 +62,27 @@
 3. 与 `ipaddress` 模拟器逐条比对动作与 seq，结果写入 `runs` 表；
 4. 结束后删除该 prefix-list。
 
-FRR 语义已对照其源码 `lib/plist.c` 核对（包含关系、无 ge/le 精确匹配、窗口、首条最小 seq、未命中 DENY）。注意 FRR 对**空** prefix-list 返回 PERMIT，因此空策略会被报为 lab setup error 而非静默一致。
+FRR 语义已对照其源码 `lib/plist.c` 核对（包含关系、无 ge/le 精确匹配、窗口、首条最小 seq、未命中 DENY）。注意 FRR 对**空** prefix-list 返回 PERMIT，因此空策略会被报为 lab setup error 而非静默一致。策略级 `default-action permit` 在 FRR 中没有直接对应物（prefix-list 未命中固定 DENY）：验证器仅在**验证期间**向 FRR 安装合成兜底规则（`seq 4294967294 permit 0/0 le max`），比对时把该命中归一为模拟器的“默认终止”；冻结与实际发布的配置里都不含这条合成规则。
 
-传输默认 `docker exec`（`RLAB_FRR_TRANSPORT=docker`），也可切到 SSH（`RLAB_FRR_TRANSPORT=ssh`，见 `backend/app/config.py`）。容器不在线时相关测试自动 skip，UI 显示离线徽标。
+传输默认 `docker exec`（`RLAB_FRR_TRANSPORT=docker`），也可切到 SSH（`RLAB_FRR_TRANSPORT=ssh`，见 `backend/app/config.py`）。容器不在线时相关测试自动 skip，UI 显示离线徽标。对**已发布的活跃快照**做交叉验证自动切换为只读模式（`install=false`，不删除线上列表），避免核对动作破坏隔离设备配置。
+
+## 4b. 可审查发布闭环（验证 / 审批 / 模拟发布 / 回滚）
+
+快照在不可变 payload 之上走完整状态机，全程**只接触本地隔离 FRR**：
+
+```
+draft ─▶ validating ─┬─▶ validation_failed ─▶(重新验证) pending_approval
+                     └─▶ pending_approval ─▶ approved ─▶ simulated_published ─▶ superseded
+```
+
+* **验证** `/api/snapshots/{id}/validate`：冻结探针（留空自动取基线语义差异的最小见证集 + 各规则基址 + 默认动作探针），跑模拟器与隔离 FRR 交叉验证，证据含**规则顺序（seq 序列 + SHA-256 内容哈希）、邻居绑定、默认动作、对当前生效版本的语义差异、逐条探针结果、FRR 证据与渲染配置**；FRR 不在线且 `RLAB_REQUIRE_FRR=1`（默认）时置 `validation_failed`。
+* **审批** `/approve`：仅 `pending_approval` 可批；把上述证据整包**冻结**进 `approval`（含审批人/意见/时间）。之后任何规则、默认动作或邻居绑定变更都把未发布的已批/待批快照打回 `validation_failed`（带原因）；再编辑只能产生**新草稿版本**，旧快照永不改写。
+* **模拟发布** `/publish`（支持 `Idempotency-Key` 请求头）：仅 `approved` 可发布。先向隔离节点安装并 `show` 复核 + 用冻结探针在**实际安装配置**上独立重测，全部通过后才在单事务内把该节点的 active 指针切到新版本（旧记录 `superseded`）。设备失败即补偿恢复基线版本，发布记录保持 `failed` 且**可重试**（`/releases/{id}/retry`，attempts 递增），DB 与容器不会分叉。
+* **并发/重复**：部分唯一索引保证每 `(policy, node)` 至多一个 `applying`、一个 `active`；重复发布同一已生效快照直接返回同一记录；竞争发布一个生效、另一个 409，且已装上设备的一方若 DB 提交落败会自动把设备补偿回获胜版本。
+* **回滚** `/rollback`：从**历史快照**创建**新的追加发布记录**（`kind=rollback`，记录 `rolled_back_release_id`），旧记录只变 `superseded` 不回写；只能回滚曾经成功发布过的版本。
+* **核对** `/policies/{id}/drift` 读取隔离设备实际配置核对；前端“⑤ 验证/审批/发布/回滚”页可查看状态流、冻结证据（哈希/规则顺序/邻居/差异/探针/FRR 配置）、发布历史、失败重试与回滚，并对比回滚前后的最小见证前缀与设备实际配置。
+
+迁移：`backend/app/migrations.py` 为无 Alembic 的版本化迁移（SQLite 与 PostgreSQL 同一套），全新库按当前模型建表并 stamp，旧库逐 revision 升级（向 `snapshots` 增加生命周期列，新建 `releases`、`idempotency_keys` 表与部分唯一索引）。
 
 ## 5. 快速开始
 
@@ -110,7 +128,7 @@ python -m pytest tests/ -q
 * `test_engine.py`：精确匹配、ge/le 窗口、首条匹配、默认拒绝、v4/v6 隔离、三个示例决策；
 * `test_properties.py`：在完整枚举的 /0../6（v4）与 /32../34（v6）格子上，对数百个随机策略用暴力预言机验证**遮蔽判定**与**最小见证集**逐区域一致（非采样）；
 * `test_api.py`：编辑→快照→差异→回放的端到端 REST；
-* `test_frr_consistency.py`：FRR 输出解析、随机 400 例与 FRR `prefix_list_apply` 移植模型逐条一致；`test_live_frr_consistency` 在检测到容器时自动对真实 FRR 运行。
+* `test_release.py`：发布闭环验收——验证→审批→模拟发布可回放；规则/默认动作变更使旧审批失效；重复与并发发布仅一个版本生效（部分唯一索引 + 门控竞态）；容器应用失败后 DB 保持 `failed` 可重试、补偿回基线、恢复后重试成功；回滚追加新记录且前后快照/最小见证前缀/实际隔离配置均可核对；IPv4/IPv6、默认拒绝与默认许可（合成 guard 调和）不回归；`test_frr_consistency.py`：FRR 输出解析、随机 400 例与 FRR `prefix_list_apply` 移植模型逐条一致；`test_live_frr_consistency` 在检测到容器时自动对真实 FRR 运行。
 
 ## 7. 主要 API
 
@@ -125,7 +143,15 @@ python -m pytest tests/ -q
 | POST | `/api/policies/{id}/snapshots` | 创建不可变快照 |
 | POST | `/api/snapshots/diff` | 两个快照的最小见证集差异 |
 | POST | `/api/snapshots/{id}/replay` | 有序探针确定性回放 |
-| POST | `/api/snapshots/{id}/cross-validate` | 推送 FRR 容器并逐条比对 |
+| POST | `/api/snapshots/{id}/cross-validate` | 推送 FRR 容器并逐条比对（活跃快照自动只读） |
+| POST | `/api/snapshots/{id}/validate` | 发布流水线：模拟器+FRR 验证，冻结证据 |
+| POST | `/api/snapshots/{id}/approve` | 审批，冻结规则顺序/邻居/默认/差异/探针/FRR 证据 |
+| POST | `/api/snapshots/{id}/publish` | 模拟发布到隔离 FRR（支持 `Idempotency-Key`） |
+| POST | `/api/snapshots/{id}/rollback` | 回滚到历史快照（追加新发布记录） |
+| GET | `/api/policies/{id}/releases`、`/api/releases`、`/api/releases/{id}` | 发布/回滚历史（只追加） |
+| POST | `/api/releases/{id}/retry` | 重试失败的发布（设备补偿后 DB 可重试） |
+| GET | `/api/policies/{id}/drift`、`/active-release` | 设备实际配置漂移核对、当前生效版本 |
+| PUT/DELETE | `/api/neighbors/{id}` | 邻居改/删（影响冻结绑定时失效旧审批） |
 | GET/POST | `/api/scenarios`、`/api/scenarios/{id}/replay` | 场景（输入+两个快照+结果） |
 | GET/POST | `/api/neighbors` | 本地实验室邻居 |
 | GET | `/api/frr/status`、`/api/runs` | 容器在线状态、历史验证运行 |
@@ -135,8 +161,10 @@ python -m pytest tests/ -q
 ```
 backend/app/   engine.py(匹配/遮蔽) trie.py(精确单元+最小见证) service.py db.py
                validate.py frr_bridge.py treeview.py routers/api.py seed.py
-frontend/src/  App.jsx + components/(PolicyEditor/TrieView/DiffView/ReplayLab/Neighbors)
+               workflow.py(验证/审批/发布/回滚状态机) migrations.py(SQLite/PG 迁移)
+frontend/src/  App.jsx + components/(PolicyEditor/TrieView/DiffView/ReplayLab/
+               ReleaseGate/Neighbors)
 frr/           两个节点的 daemons/vtysh/frr.conf 与独立 docker-compose
-tests/         引擎/属性/API/FRR 一致性
+tests/         引擎/属性/API/FRR 一致性/发布闭环验收
 docker-compose.yml   postgres + backend + router-a/b
 ```

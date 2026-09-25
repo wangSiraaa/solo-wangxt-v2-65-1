@@ -34,6 +34,9 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://rlab:rlab@postgres:5432/rlab
       RLAB_FRR_TRANSPORT: docker
+      FRR_CONTAINER_A: rpolicy-router-a
+      FRR_CONTAINER_B: rpolicy-router-b
+      RLAB_REQUIRE_FRR: "1"
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     ports:
       - "127.0.0.1:8765:8765"

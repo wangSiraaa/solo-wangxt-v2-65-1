@@ -5,8 +5,8 @@ import datetime as dt
 from typing import List
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
-    create_engine, select,
+    JSON, Boolean, DateTime, ForeignKey, Integer, String, Text,
+    UniqueConstraint, create_engine, select,
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session,
@@ -81,11 +81,39 @@ class Rule(Base):
     policy: Mapped[Policy] = relationship(back_populates="rules")
 
 
+# Snapshot lifecycle states for the auditable release pipeline.
+#
+#   draft              freshly captured, never validated
+#   validating         validation in progress (transient, synchronous API)
+#   validation_failed  validation failed OR an earlier approval was
+#                      invalidated by a later rule/neighbor/default edit
+#   pending_approval   validation passed, awaiting approval
+#   approved           approval frozen (rule order, neighbors, default
+#                      action, semantic diff, probe results, FRR evidence)
+#   simulated_published  applied to the local isolated FRR node (active)
+#   superseded         replaced by a later active release / rolled back
+#
+# Snapshots themselves are immutable (payload + frr_config never change);
+# only lifecycle metadata transitions.  Every edit to the working policy
+# captures a NEW draft snapshot — old versions are never rewritten.
+SNAPSHOT_STATES = (
+    "draft", "validating", "validation_failed", "pending_approval",
+    "approved", "simulated_published", "superseded",
+)
+
+# Release records are append-only audit rows; only ONE row per
+# (policy, node) may be status='applying' and only ONE 'active'.
+RELEASE_STATES = ("applying", "active", "failed", "superseded")
+
+
 class Snapshot(Base):
     """
     Immutable configuration snapshot.  payload is the exact, replayable
     policy body: ordered rules + default action + family, plus FRR-rendered
     config and metadata.  Replays never depend on later edits.
+
+    Lifecycle columns (release pipeline) are kept separate from payload so
+    the frozen configuration can never be mutated after capture.
     """
     __tablename__ = "snapshots"
 
@@ -98,8 +126,67 @@ class Snapshot(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
     created_by: Mapped[str] = mapped_column(String(64), default="lab")
 
+    # ---- release pipeline lifecycle ----
+    status: Mapped[str] = mapped_column(String(24), default="draft")
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    validation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    approval: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    invalidated_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
     policy: Mapped[Policy] = relationship(back_populates="snapshots")
     __table_args__ = (UniqueConstraint("policy_id", "version", name="uq_policy_version"),)
+
+
+class Release(Base):
+    """
+    One simulated-publish attempt against a local isolated FRR node.
+
+    Append-only: rollbacks create NEW rows (kind='rollback') pointing at the
+    historical snapshot restored; the previous release is marked
+    'superseded' but never rewritten.  Compensating action on apply failure
+    is recorded so DB and container state stay reconcilable.
+    """
+    __tablename__ = "releases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    policy_id: Mapped[int] = mapped_column(ForeignKey("policies.id", ondelete="CASCADE"))
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("snapshots.id"))
+    node: Mapped[str] = mapped_column(String(16), default="a")
+    kind: Mapped[str] = mapped_column(String(16), default="publish")  # publish/rollback
+    status: Mapped[str] = mapped_column(String(16), default="applying")
+    # snapshot that was live before this record (target of compensation /
+    # the version restored when the apply fails)
+    baseline_release_id: Mapped[int | None] = mapped_column(
+        ForeignKey("releases.id"), nullable=True)
+    # for kind='rollback': the earlier release being rolled back from
+    rolled_back_release_id: Mapped[int | None] = mapped_column(
+        ForeignKey("releases.id"), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    applied_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # append-only per-attempt outcome log (start/success/failure/compensate)
+    events: Mapped[list] = mapped_column(JSON, default=list)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow)
+    created_by: Mapped[str] = mapped_column(String(64), default="lab")
+
+    # Partial unique indexes enforcing "one applying / one active release
+    # per (policy, node)" are created in DDL (migrations.py) because the
+    # WHERE-clause syntax differs between SQLite and PostgreSQL.
+
+
+class IdempotencyKey(Base):
+    """Stored Idempotency-Key -> response, so retried mutating calls replay."""
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(64), default="default")
+    request_hash: Mapped[str] = mapped_column(String(64))
+    method_path: Mapped[str] = mapped_column(String(256), default="")
+    response: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Scenario(Base):
@@ -132,7 +219,8 @@ class Run(Base):
 
 
 def init_db() -> None:
-    Base.metadata.create_all(engine)
+    from .migrations import run_migrations
+    run_migrations()
 
 
 def get_session() -> Session:

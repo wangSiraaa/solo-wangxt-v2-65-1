@@ -1,16 +1,18 @@
 """HTTP API."""
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .. import db as dbmod, service
+from .. import db as dbmod, service, workflow
 from ..engine import PolicyError
 from ..schemas import (
-    ClassifyIn, DiffIn, NeighborIn, PolicyIn, PolicyRulesIn, ProbesIn,
-    ScenarioIn, SnapshotIn,
+    ApproveIn, ClassifyIn, DiffIn, NeighborIn, PolicyIn, PolicyRulesIn,
+    ProbesIn, PublishIn, RollbackIn, ScenarioIn, SnapshotIn, ValidateIn,
 )
 from ..service import ValidationError
 from ..treeview import policy_trie, hit_path, coverage_map
@@ -73,10 +75,14 @@ def get_policy(pid: int, db: Session = Depends(get_db)):
 @router.put("/policies/{pid}")
 def update_policy_meta(pid: int, body: PolicyIn, db: Session = Depends(get_db)):
     p = _get_policy(db, pid)
+    default_changed = p.default_action != body.default_action
     p.default_action = body.default_action
     p.description = body.description
     db.commit()
     db.refresh(p)
+    if default_changed:
+        workflow.invalidate_open_versions(
+            db, p, reason="default action changed after validation/approval")
     return service.policy_payload(p)
 
 
@@ -228,6 +234,189 @@ def list_runs(limit: int = 50, db: Session = Depends(get_db)):
     } for r in runs]
 
 
+# ------------------------------------------------- release: validate/approve
+def _get_snapshot(db: Session, sid: int) -> dbmod.Snapshot:
+    s = db.get(dbmod.Snapshot, sid)
+    if s is None:
+        raise HTTPException(404, "snapshot not found")
+    return s
+
+
+async def _idempotent(db: Session, request: Request, key: str | None,
+                      scope: str, producer):
+    """
+    Idempotency-Key support for mutating release endpoints.
+
+    * no key                              -> run normally
+    * key seen, same request fingerprint  -> replay stored response
+    * key seen, different fingerprint     -> 422 (do not rebind a key)
+    * new key                             -> run once, persist the response
+    """
+    if not key:
+        return producer()
+    body = await request.body()
+    fingerprint = hashlib.sha256(
+        f"{scope}|{body.decode(errors='replace')}".encode()).hexdigest()
+    row = db.get(dbmod.IdempotencyKey, key)
+    if row is not None:
+        if row.request_hash != fingerprint:
+            raise HTTPException(422,
+                                "Idempotency-Key reused with a different payload")
+        return row.response
+    result = producer()
+    rec = dbmod.IdempotencyKey(
+        key=key, scope=scope, request_hash=fingerprint,
+        method_path=scope, response=result)
+    db.add(rec)
+    try:
+        db.commit()
+    except IntegrityError:
+        # concurrent request with the same key won the insert; replay theirs
+        db.rollback()
+        winner = db.get(dbmod.IdempotencyKey, key)
+        if winner is not None:
+            if winner.request_hash != fingerprint:
+                raise HTTPException(422,
+                                    "Idempotency-Key reused with a different payload")
+            return winner.response
+        raise
+    return result
+
+
+@router.post("/snapshots/{sid}/validate")
+def validate_snapshot(sid: int, body: ValidateIn,
+                      db: Session = Depends(get_db)):
+    s = _get_snapshot(db, sid)
+    try:
+        return workflow.validate_snapshot(
+            db, sid, probes=body.probes, node=body.node)
+    except workflow.WorkflowError as e:
+        # state violations are 409; a failed FRR validation is still a
+        # terminal validation_failed state -> 422 with evidence in body
+        msg = str(e)
+        snap = db.get(dbmod.Snapshot, sid)
+        if snap is not None and snap.status == "validation_failed":
+            raise HTTPException(422, msg)
+        raise HTTPException(409, msg)
+
+
+@router.post("/snapshots/{sid}/approve")
+def approve_snapshot(sid: int, body: ApproveIn,
+                     db: Session = Depends(get_db)):
+    _get_snapshot(db, sid)
+    try:
+        return workflow.approve_snapshot(
+            db, sid, approver=body.approver, comment=body.comment)
+    except workflow.WorkflowError as e:
+        raise HTTPException(409, str(e))
+
+
+# ------------------------------------------------- release: publish/rollback
+def _release_payload(db: Session, rel: dbmod.Release) -> dict:
+    return workflow.release_dict(rel, session=db)
+
+
+@router.post("/snapshots/{sid}/publish")
+async def publish_snapshot(sid: int, body: PublishIn,
+                           request: Request,
+                           idempotency_key: str | None = Header(default=None),
+                           db: Session = Depends(get_db)):
+    _get_snapshot(db, sid)
+
+    def _do():
+        try:
+            rel = workflow.publish_snapshot(
+                db, sid, node=body.node, created_by=body.created_by,
+                idempotency_key=idempotency_key)
+        except workflow.WorkflowError as e:
+            raise HTTPException(409, str(e))
+        except FRRUnavailable as e:
+            raise HTTPException(503, str(e))
+        return _release_payload(db, rel)
+
+    return await _idempotent(db, request, idempotency_key,
+                             f"publish:{sid}:{body.node}", _do)
+
+
+@router.get("/policies/{pid}/releases")
+def list_releases(pid: int, db: Session = Depends(get_db)):
+    _get_policy(db, pid)
+    rels = db.query(dbmod.Release).filter_by(policy_id=pid) \
+        .order_by(dbmod.Release.id.desc()).all()
+    return [_release_payload(db, r) for r in rels]
+
+
+@router.get("/releases")
+def all_releases(limit: int = 100, db: Session = Depends(get_db)):
+    rels = db.query(dbmod.Release).order_by(dbmod.Release.id.desc()) \
+        .limit(limit).all()
+    return [_release_payload(db, r) for r in rels]
+
+
+@router.get("/releases/{rid}")
+def get_release(rid: int, db: Session = Depends(get_db)):
+    rel = db.get(dbmod.Release, rid)
+    if rel is None:
+        raise HTTPException(404, "release not found")
+    return _release_payload(db, rel)
+
+
+@router.post("/releases/{rid}/retry")
+def retry_release(rid: int, db: Session = Depends(get_db)):
+    rel = db.get(dbmod.Release, rid)
+    if rel is None:
+        raise HTTPException(404, "release not found")
+    try:
+        rel = workflow.retry_release(db, rid)
+    except workflow.WorkflowError as e:
+        # keep 409 for state errors; failed apply -> 422 and row stays failed
+        cur = db.get(dbmod.Release, rid)
+        if cur is not None and cur.status == "failed":
+            raise HTTPException(422, str(e))
+        raise HTTPException(409, str(e))
+    except FRRUnavailable as e:
+        raise HTTPException(503, str(e))
+    return _release_payload(db, rel)
+
+
+@router.post("/snapshots/{sid}/rollback")
+async def rollback_to(sid: int, body: RollbackIn,
+                      request: Request,
+                      idempotency_key: str | None = Header(default=None),
+                      db: Session = Depends(get_db)):
+    _get_snapshot(db, sid)
+
+    def _do():
+        try:
+            rel = workflow.rollback(
+                db, sid, node=body.node, created_by=body.created_by,
+                idempotency_key=idempotency_key)
+        except workflow.WorkflowError as e:
+            raise HTTPException(409, str(e))
+        except FRRUnavailable as e:
+            raise HTTPException(503, str(e))
+        return _release_payload(db, rel)
+
+    return await _idempotent(db, request, idempotency_key,
+                             f"rollback:{sid}:{body.node}", _do)
+
+
+@router.get("/policies/{pid}/drift")
+def policy_drift(pid: int, node: str = "a", db: Session = Depends(get_db)):
+    _get_policy(db, pid)
+    try:
+        return workflow.check_drift(db, pid, node=node)
+    except FRRUnavailable as e:
+        raise HTTPException(503, str(e))
+
+
+@router.get("/policies/{pid}/active-release")
+def active_release(pid: int, node: str = "a", db: Session = Depends(get_db)):
+    _get_policy(db, pid)
+    rel = workflow._active_release(db, pid, node)
+    return _release_payload(db, rel) if rel else None
+
+
 # --------------------------------------------------------------- neighbors
 @router.get("/neighbors")
 def list_neighbors(db: Session = Depends(get_db)):
@@ -250,7 +439,50 @@ def create_neighbor(body: NeighborIn, db: Session = Depends(get_db)):
     db.add(n)
     db.commit()
     db.refresh(n)
+    _invalidate_neighbor_binding(db, body.inbound_policy, body.outbound_policy)
     return {"id": n.id, **body.model_dump()}
+
+
+def _invalidate_neighbor_binding(db: Session, *policy_names: str | None) -> None:
+    """Neighbor bindings are frozen into approval evidence; binding changes
+    invalidate open (unpublished) approvals of affected policies."""
+    names = {n for n in policy_names if n}
+    if not names:
+        return
+    for p in db.query(dbmod.Policy).filter(dbmod.Policy.name.in_(names)).all():
+        workflow.invalidate_open_versions(
+            db, p, reason="bound neighbors changed after validation/approval")
+
+
+@router.put("/neighbors/{nid}")
+def update_neighbor(nid: int, body: NeighborIn, db: Session = Depends(get_db)):
+    n = db.get(dbmod.Neighbor, nid)
+    if n is None:
+        raise HTTPException(404, "neighbor not found")
+    try:
+        net = ipaddress.ip_network(body.ip, strict=False)
+    except ValueError as e:
+        raise HTTPException(422, f"bad neighbor ip: {e}")
+    if net.version != body.family:
+        raise HTTPException(422, "ip family does not match family")
+    affected = {n.inbound_policy, n.outbound_policy,
+                body.inbound_policy, body.outbound_policy}
+    for k, v in body.model_dump().items():
+        setattr(n, k, v)
+    db.commit()
+    _invalidate_neighbor_binding(db, *affected)
+    return {"id": n.id, **body.model_dump()}
+
+
+@router.delete("/neighbors/{nid}", status_code=204)
+def delete_neighbor(nid: int, db: Session = Depends(get_db)):
+    n = db.get(dbmod.Neighbor, nid)
+    if n is None:
+        raise HTTPException(404, "neighbor not found")
+    affected = {n.inbound_policy, n.outbound_policy}
+    db.delete(n)
+    db.commit()
+    _invalidate_neighbor_binding(db, *affected)
 
 
 # --------------------------------------------------------------- scenarios

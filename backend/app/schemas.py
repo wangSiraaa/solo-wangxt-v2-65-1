@@ -63,3 +63,25 @@ class NeighborIn(BaseModel):
     inbound_policy: Optional[str] = None
     outbound_policy: Optional[str] = None
     description: str = ""
+
+
+# ------------------------------------------------------- release pipeline
+class ValidateIn(BaseModel):
+    probes: Optional[List[str]] = None
+    node: str = "a"
+
+
+class ApproveIn(BaseModel):
+    approver: str = Field(default="reviewer", min_length=1, max_length=64)
+    comment: str = ""
+
+
+class PublishIn(BaseModel):
+    node: str = "a"
+    created_by: str = "lab"
+
+
+class RollbackIn(BaseModel):
+    node: str = "a"
+    created_by: str = "lab"
+    comment: str = ""

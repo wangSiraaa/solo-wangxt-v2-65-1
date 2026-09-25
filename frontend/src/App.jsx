@@ -4,6 +4,7 @@ import PolicyEditor from './components/PolicyEditor.jsx'
 import TrieView from './components/TrieView.jsx'
 import DiffView from './components/DiffView.jsx'
 import ReplayLab from './components/ReplayLab.jsx'
+import ReleaseGate from './components/ReleaseGate.jsx'
 import Neighbors from './components/Neighbors.jsx'
 
 const TABS = [
@@ -11,7 +12,8 @@ const TABS = [
   { id: 'trie', label: '② 前缀树 / 命中链', comp: TrieView },
   { id: 'diff', label: '③ 语义差异（最小见证）', comp: DiffView },
   { id: 'replay', label: '④ 回放 / FRR 交叉验证', comp: ReplayLab },
-  { id: 'neighbors', label: '⑤ 邻居', comp: Neighbors },
+  { id: 'gate', label: '⑤ 验证 / 审批 / 发布 / 回滚', comp: ReleaseGate },
+  { id: 'neighbors', label: '⑥ 邻居', comp: Neighbors },
 ]
 
 export default function App() {

@@ -22,4 +22,15 @@ FRR_SSH_PORT_B = int(os.environ.get("FRR_SSH_PORT_B", "2223"))
 FRR_SSH_USER = os.environ.get("FRR_SSH_USER", "root")
 FRR_SSH_PASSWORD = os.environ.get("FRR_SSH_PASSWORD", "frrouting")
 
+# Local isolated FRR lab containers (names overridable for nested/isolated
+# environments). These are the ONLY devices publish touches; production gear
+# is never contacted.
+FRR_CONTAINER_A = os.environ.get("FRR_CONTAINER_A", "rpolicy-router-a")
+FRR_CONTAINER_B = os.environ.get("FRR_CONTAINER_B", "rpolicy-router-b")
+
+# Validation policy: an FRR cross-validation is part of the frozen approval
+# evidence. In container-less labs it may be explicitly relaxed.
+RLAB_REQUIRE_FRR = os.environ.get(
+    "RLAB_REQUIRE_FRR", "1").lower() not in ("0", "false", "no")
+
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",")

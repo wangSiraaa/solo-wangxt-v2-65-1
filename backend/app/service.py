@@ -51,8 +51,23 @@ def policy_payload(db_pol: dbmod.Policy) -> dict:
             } for r in db_pol.rules
         ],
         "frr_config": ep.to_frr_prefix_list(),
+        "working_hash": _policy_hash(db_pol),
         "updated_at": db_pol.updated_at.isoformat() if db_pol.updated_at else None,
     }
+
+
+def _policy_hash(db_pol: dbmod.Policy) -> str:
+    import hashlib
+    import json
+    blob = json.dumps(
+        {"name": db_pol.name, "family": db_pol.family,
+         "default_action": db_pol.default_action,
+         "rules": [
+             {"seq": r.seq, "prefix": r.prefix, "action": r.action,
+              "ge": r.ge, "le": r.le}
+             for r in sorted(db_pol.rules, key=lambda r: r.seq)]},
+        sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
 
 
 def validate_rule_dicts(family: int, rules: List[dict]) -> List[EngineRule]:
@@ -97,6 +112,12 @@ def replace_rules(session: Session, db_pol: dbmod.Policy,
     session.add(db_pol)
     session.commit()
     session.refresh(db_pol)
+    # Any approval frozen on the OLD rule order / content is now stale and
+    # must be re-validated before it can be published again.
+    from . import workflow
+    workflow.invalidate_open_versions(
+        session, db_pol,
+        reason="rules edited after validation/approval")
     return db_pol
 
 
@@ -113,26 +134,31 @@ def create_snapshot(session: Session, db_pol: dbmod.Policy,
         .order_by(dbmod.Snapshot.version.desc())
     )
     version = (last.version + 1) if last else 1
+    payload = {
+        "name": db_pol.name,
+        "family": db_pol.family,
+        "default_action": db_pol.default_action,
+        "rules": [
+            {"seq": r.seq, "prefix": r.prefix, "action": r.action,
+             "ge": r.ge, "le": r.le, "remark": r.remark or ""}
+            for r in db_pol.rules
+        ],
+    }
     snap = dbmod.Snapshot(
         policy_id=db_pol.id,
         version=version,
         label=label or f"v{version}",
-        payload={
-            "name": db_pol.name,
-            "family": db_pol.family,
-            "default_action": db_pol.default_action,
-            "rules": [
-                {"seq": r.seq, "prefix": r.prefix, "action": r.action,
-                 "ge": r.ge, "le": r.le, "remark": r.remark or ""}
-                for r in db_pol.rules
-            ],
-        },
+        payload=payload,
         frr_config=ep.to_frr_prefix_list(),
         created_by=created_by,
+        status="draft",
     )
     session.add(snap)
     session.commit()
     session.refresh(snap)
+    from . import workflow
+    snap.content_hash = workflow.content_hash(snap)
+    session.commit()
     return snap
 
 
@@ -145,6 +171,7 @@ def engine_policy_from_snapshot(snap: dbmod.Snapshot) -> EnginePolicy:
 
 
 def snapshot_dict(snap: dbmod.Snapshot) -> dict:
+    from . import workflow
     return {
         "id": snap.id,
         "policy_id": snap.policy_id,
@@ -154,6 +181,11 @@ def snapshot_dict(snap: dbmod.Snapshot) -> dict:
         "frr_config": snap.frr_config,
         "created_by": snap.created_by,
         "created_at": snap.created_at.isoformat(),
+        "status": snap.status,
+        "content_hash": snap.content_hash or workflow.content_hash(snap),
+        "validation": snap.validation,
+        "approval": snap.approval,
+        "invalidated_reason": snap.invalidated_reason,
     }
 
 

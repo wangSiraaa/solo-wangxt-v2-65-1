@@ -33,6 +33,7 @@ from typing import List, Optional
 import paramiko
 
 from .config import (
+    FRR_CONTAINER_A, FRR_CONTAINER_B,
     FRR_HOST_A, FRR_HOST_B, FRR_SSH_PORT_A, FRR_SSH_PORT_B,
     FRR_SSH_USER, FRR_SSH_PASSWORD,
 )
@@ -54,9 +55,31 @@ class FRRObservation:
 
 
 NODES = {
-    "a": {"docker": "rpolicy-router-a", "host": FRR_HOST_A, "port": FRR_SSH_PORT_A},
-    "b": {"docker": "rpolicy-router-b", "host": FRR_HOST_B, "port": FRR_SSH_PORT_B},
+    "a": {"docker": FRR_CONTAINER_A, "host": FRR_HOST_A, "port": FRR_SSH_PORT_A},
+    "b": {"docker": FRR_CONTAINER_B, "host": FRR_HOST_B, "port": FRR_SSH_PORT_B},
 }
+
+
+def make_bridge(node: str = "a", timeout: float = 30.0) -> "FRRBridge":
+    """
+    Bridge factory. The release pipeline always goes through this indirection
+    so tests can swap in an in-process fake (no docker socket needed), and
+    isolated environments can override transports via configuration.
+    """
+    return _bridge_factory(node=node, timeout=timeout)
+
+
+def _default_bridge_factory(node: str = "a", timeout: float = 30.0) -> "FRRBridge":
+    return FRRBridge(node=node, timeout=timeout)
+
+
+# Tests/integration adapters replace THIS callable; the rest of the app
+# always reaches a node through get_bridge().
+_bridge_factory = _default_bridge_factory
+
+
+def get_bridge(node: str = "a", timeout: float = 30.0) -> "FRRBridge":
+    return _bridge_factory(node=node, timeout=timeout)
 
 
 class FRRBridge:
@@ -151,27 +174,46 @@ class FRRBridge:
             raise FRRUnavailable(f"vtysh rc={rc}: {err.strip() or out.strip()}")
         return out + err
 
-    # ------------------------------------------------------------- provision
-    def install_policy(self, policy: Policy, vrf: str = "") -> str:
+    # ------------------------------------------------- provision
+    def install_policy(self, policy: Policy, vrf: str = "",
+                       persist: bool = True) -> str:
         cmds = ["configure terminal"]
         if vrf:
             cmds.append(f"vrf {vrf}")
         cmds += policy.to_frr_prefix_list().splitlines()
-        cmds += ["end", "write memory"]
-        return self.vtysh(cmds)
+        cmds.append("end")
+        if persist:
+            cmds.append("write memory")
+        # `write memory` can warn on the read-only /etc/frr mount used by the
+        # isolated lab; config still takes effect in the running daemon.
+        return self.vtysh(cmds, allow_warning_rc=True)
 
-    def remove_policy(self, name: str, family: int, vrf: str = "") -> str:
+    def remove_policy(self, name: str, family: int, vrf: str = "",
+                      persist: bool = True) -> str:
         ip = "ip" if family == 4 else "ipv6"
         cmds = ["configure terminal"]
         if vrf:
             cmds.append(f"vrf {vrf}")
         cmds.append(f"no {ip} prefix-list {name}")
-        cmds += ["end", "write memory"]
-        return self.vtysh(cmds)
+        cmds.append("end")
+        if persist:
+            cmds.append("write memory")
+        return self.vtysh(cmds, allow_warning_rc=True)
 
     def show_prefix_list(self, name: str, family: int) -> str:
         ip = "ip" if family == 4 else "ipv6"
         return self.vtysh([f"show {ip} prefix-list {name}"])
+
+    # ------------------------------------------------- simulated publish
+    def apply_policy(self, policy: Policy, vrf: str = "") -> str:
+        """
+        Install a snapshot's rendered config to the isolated node and PERSIST
+        it (write memory). Returns the post-install `show` output so the
+        caller can verify the container actually holds exactly the intended
+        configuration before any database state flips.
+        """
+        self.install_policy(policy, vrf=vrf)
+        return self.show_prefix_list(policy.name, policy.family)
 
     # -------------------------------------------------------------- observe
     # FRR reference oracle (verified against FRR 8.5/8.4 source, plist.c):

@@ -1,9 +1,11 @@
 const BASE = '/api';
 
-async function req(path, { method = 'GET', body } = {}) {
+async function req(path, { method = 'GET', body, headers } = {}) {
+  const h = headers || {};
+  if (body) h['Content-Type'] = 'application/json';
   const r = await fetch(BASE + path, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: Object.keys(h).length ? h : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await r.text();
@@ -39,4 +41,25 @@ export const api = {
   crossValidate: (id, probes, node = 'a') =>
     req(`/snapshots/${id}/cross-validate`, { method: 'POST', body: { probes, node } }),
   runs: () => req('/runs'),
+
+  // ---- release pipeline ----
+  validateSnapshot: (id, probes = null, node = 'a') =>
+    req(`/snapshots/${id}/validate`, { method: 'POST', body: { probes, node } }),
+  approveSnapshot: (id, approver, comment) =>
+    req(`/snapshots/${id}/approve`, { method: 'POST', body: { approver, comment } }),
+  publishSnapshot: (id, node = 'a', key = null) =>
+    req(`/snapshots/${id}/publish`, {
+      method: 'POST', body: { node }, headers: key ? { 'Idempotency-Key': key } : undefined,
+    }),
+  rollbackSnapshot: (id, node = 'a', key = null) =>
+    req(`/snapshots/${id}/rollback`, {
+      method: 'POST', body: { node }, headers: key ? { 'Idempotency-Key': key } : undefined,
+    }),
+  releases: (pid) => req(`/policies/${pid}/releases`),
+  allReleases: () => req('/releases'),
+  release: (id) => req(`/releases/${id}`),
+  retryRelease: (id) => req(`/releases/${id}/retry`, { method: 'POST' }),
+  drift: (pid, node = 'a') => req(`/policies/${pid}/drift?node=${node}`),
+  activeRelease: (pid, node = 'a') =>
+    req(`/policies/${pid}/active-release?node=${node}`),
 };
